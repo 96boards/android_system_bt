@@ -43,23 +43,11 @@ const char *dev_path = "/dev/uhid";
 static tBTA_HH_RPT_CACHE_ENTRY sReportCache[BTA_HH_NV_LOAD_MAX];
 #endif
 
-void uhid_set_non_blocking(int fd)
-{
-    int opts = fcntl(fd, F_GETFL);
-    if (opts < 0)
-        APPL_TRACE_ERROR("%s() Getting flags failed (%s)", __func__, strerror(errno));
-
-    opts |= O_NONBLOCK;
-
-    if (fcntl(fd, F_SETFL, opts) < 0)
-        APPL_TRACE_EVENT("%s() Setting non-blocking flag failed (%s)", __func__, strerror(errno));
-}
-
 /*Internal function to perform UHID write and error checking*/
 static int uhid_write(int fd, const struct uhid_event *ev)
 {
-    ssize_t ret = write(fd, ev, sizeof(*ev));
-
+    ssize_t ret;
+    ret = write(fd, ev, sizeof(*ev));
     if (ret < 0){
         int rtn = -errno;
         APPL_TRACE_ERROR("%s: Cannot write to uhid:%s",
@@ -69,9 +57,9 @@ static int uhid_write(int fd, const struct uhid_event *ev)
         APPL_TRACE_ERROR("%s: Wrong size written to uhid: %zd != %zu",
                          __FUNCTION__, ret, sizeof(*ev));
         return -EFAULT;
+    } else {
+        return 0;
     }
-
-    return 0;
 }
 
 /* Internal function to parse the events received from UHID driver*/
@@ -94,31 +82,24 @@ static int uhid_event(btif_hh_device_t *p_dev)
         APPL_TRACE_ERROR("%s: Cannot read uhid-cdev: %s", __FUNCTION__,
                                                 strerror(errno));
         return -errno;
-    } else if ((ev.type == UHID_OUTPUT) || (ev.type==UHID_OUTPUT_EV)) {
-        // Only these two types havae payload,
-        // ensure we read full event descriptor
-        if (ret < (ssize_t)sizeof(ev)) {
-            APPL_TRACE_ERROR("%s: Invalid size read from uhid-dev: %ld != %lu",
+    } else if (ret < (ssize_t)sizeof(ev.type)) {
+        APPL_TRACE_ERROR("%s: Invalid size read from uhid-dev: %zd < %zu",
                          __FUNCTION__, ret, sizeof(ev.type));
-            return -EFAULT;
-        }
+        return -EFAULT;
     }
 
     switch (ev.type) {
     case UHID_START:
         APPL_TRACE_DEBUG("UHID_START from uhid-dev\n");
-        p_dev->ready_for_data = TRUE;
         break;
     case UHID_STOP:
         APPL_TRACE_DEBUG("UHID_STOP from uhid-dev\n");
-        p_dev->ready_for_data = FALSE;
         break;
     case UHID_OPEN:
         APPL_TRACE_DEBUG("UHID_OPEN from uhid-dev\n");
         break;
     case UHID_CLOSE:
         APPL_TRACE_DEBUG("UHID_CLOSE from uhid-dev\n");
-        p_dev->ready_for_data = FALSE;
         break;
     case UHID_OUTPUT:
         if (ret < (ssize_t)(sizeof(ev.type) + sizeof(ev.u.output))) {
@@ -194,16 +175,13 @@ static inline pthread_t create_thread(void *(*start_routine)(void *), void * arg
 *******************************************************************************/
 static void *btif_hh_poll_event_thread(void *arg)
 {
+
     btif_hh_device_t *p_dev = arg;
     APPL_TRACE_DEBUG("%s: Thread created fd = %d", __func__, p_dev->fd);
     struct pollfd pfds[1];
     int ret;
-
     pfds[0].fd = p_dev->fd;
     pfds[0].events = POLLIN;
-
-    // Set the uhid fd as non-blocking to ensure we never block the BTU thread
-    uhid_set_non_blocking(p_dev->fd);
 
     while(p_dev->hh_keep_polling){
         ret = poll(pfds, 1, 50);
@@ -245,8 +223,7 @@ void bta_hh_co_destroy(int fd)
 
 int bta_hh_co_write(int fd, UINT8* rpt, UINT16 len)
 {
-    APPL_TRACE_DEBUG("%s: UHID write %d", __func__, len);
-
+    APPL_TRACE_DEBUG("bta_hh_co_data: UHID write");
     struct uhid_event ev;
     memset(&ev, 0, sizeof(ev));
     ev.type = UHID_INPUT;
@@ -257,7 +234,6 @@ int bta_hh_co_write(int fd, UINT8* rpt, UINT16 len)
         return -1;
     }
     memcpy(ev.u.input.data, rpt, len);
-
     return uhid_write(fd, &ev);
 
 }
@@ -303,11 +279,9 @@ void bta_hh_co_open(UINT8 dev_handle, UINT8 sub_class, tBTA_HH_ATTR_MASK attr_ma
                 if (p_dev->fd < 0){
                     APPL_TRACE_ERROR("%s: Error: failed to open uhid, err:%s",
                                                                     __FUNCTION__,strerror(errno));
-                    return;
                 }else
                     APPL_TRACE_DEBUG("%s: uhid fd = %d", __FUNCTION__, p_dev->fd);
             }
-
             p_dev->hh_keep_polling = 1;
             p_dev->hh_poll_thread_id = create_thread(btif_hh_poll_event_thread, p_dev);
             break;
@@ -332,7 +306,6 @@ void bta_hh_co_open(UINT8 dev_handle, UINT8 sub_class, tBTA_HH_ATTR_MASK attr_ma
                 if (p_dev->fd < 0){
                     APPL_TRACE_ERROR("%s: Error: failed to open uhid, err:%s",
                                                                     __FUNCTION__,strerror(errno));
-                    return;
                 }else{
                     APPL_TRACE_DEBUG("%s: uhid fd = %d", __FUNCTION__, p_dev->fd);
                     p_dev->hh_keep_polling = 1;
@@ -423,13 +396,11 @@ void bta_hh_co_data(UINT8 dev_handle, UINT8 *p_rpt, UINT16 len, tBTA_HH_PROTO_MO
         APPL_TRACE_WARNING("%s: Error: unknown HID device handle %d", __FUNCTION__, dev_handle);
         return;
     }
-
-    // Send the HID data to the kernel.
-    if ((p_dev->fd >= 0) && p_dev->ready_for_data) {
+    // Send the HID report to the kernel.
+    if (p_dev->fd >= 0) {
         bta_hh_co_write(p_dev->fd, p_rpt, len);
     }else {
-        APPL_TRACE_WARNING("%s: Error: fd = %d, ready %d, len = %d", __FUNCTION__, p_dev->fd, 
-                            p_dev->ready_for_data, len);
+        APPL_TRACE_WARNING("%s: Error: fd = %d, len = %d", __FUNCTION__, p_dev->fd, len);
     }
 }
 
@@ -465,7 +436,7 @@ void bta_hh_co_send_hid_info(btif_hh_device_t *p_dev, char *dev_name, UINT16 ven
                                                                     vendor_id, product_id,
                                                                     version, ctry_code);
 
-    //Create and send hid descriptor to kernel
+//Create and send hid descriptor to kernel
     memset(&ev, 0, sizeof(ev));
     ev.type = UHID_CREATE;
     strncpy((char*)ev.u.create.name, dev_name, sizeof(ev.u.create.name) - 1);
@@ -483,7 +454,7 @@ void bta_hh_co_send_hid_info(btif_hh_device_t *p_dev, char *dev_name, UINT16 ven
     ev.u.create.country = ctry_code;
     result = uhid_write(p_dev->fd, &ev);
 
-    APPL_TRACE_WARNING("%s: wrote descriptor to fd = %d, dscp_len = %d, result = %d", __FUNCTION__,
+    APPL_TRACE_WARNING("%s: fd = %d, dscp_len = %d, result = %d", __FUNCTION__,
                                                                     p_dev->fd, dscp_len, result);
 
     if (result) {
